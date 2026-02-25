@@ -42,9 +42,23 @@ class WorldDatabase:
 
     def add_lore(self, content: str, keywords: str):
         """세계관 설정 추가 (Main Writer용)"""
+
+        print(f"\n{'-'*20} [World DB: Lore 저장 데이터 확인] {'-'*20}")
+        print(f"Keywords: {keywords}")
+        print(f"Content:\n{content}")
+        print("-" * 68 + "\n")
+        
         doc = Document(
             page_content=content,
             metadata={"type": "lore", "keywords": keywords}
+        )
+        self.db.add_documents([doc])
+        self.save_db()
+
+    def add_scene_goal(self, scene_number: int, goal_content: str):
+        doc = Document(
+            page_content=f"[Scene {scene_number} 목표] {goal_content}",
+            metadata={"type": "scene_goal", "scene_num": scene_number}
         )
         self.db.add_documents([doc])
         self.save_db()

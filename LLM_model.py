@@ -3,6 +3,7 @@ import sys
 os.environ.pop("SSL_CERT_FILE", None)
 
 import re
+import json
 
 from typing import Dict, List
 from langchain_ollama import ChatOllama
@@ -13,68 +14,67 @@ from langchain_core.output_parsers import StrOutputParser
 
 
 class MainWriterAgent:
-    def __init__(self, model_name: str = "bnksys/yanolja-eeve-korean-instruct-10.8b"):
-        # 1. Local LLM (Ollama) 설정
+    def __init__(self, world_db, model_name: str = "bnksys/yanolja-eeve-korean-instruct-10.8b"):    # 1. Local LLM (Ollama) 설정
         # num_ctx는 소설의 긴 문맥을 고려하여 4096~8192 이상으로 설정 권장
+        self.world_db = world_db
         self.llm = ChatOllama(
             model=model_name,
             temperature=0.8,
             num_ctx=8192 
         )
+        self.json_parser = StrOutputParser()
 
-        # 2. Local Embedding 설정 (한국어 성능이 우수한 Ko-sRoBERTa 사용)
-        # 이 모델은 별도의 API Key가 필요 없으며 로컬 메모리에서 작동합니다.
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="jhgan/ko-sroberta-multitask",
-            model_kwargs={'device': 'cuda'} # GPU가 없다면 'cpu'로 변경
-        )
-        
-        self.narrative_db = self._prepare_narrative_rag()
 
-    def _prepare_narrative_rag(self):
-        """소설 작법 및 서사 구조 데이터 RAG 구축"""
-        texts = [
-            "기(起): 인물과 배경 소개, 사건의 발단, 일상에서 비일상으로의 전환.",
-            "승(承): 갈등의 심화, 주인공의 시련과 조력자 등장, 복선 배치.",
-            "전(轉): 갈등의 절정, 예상치 못한 반전(Anagnorisis), 서사의 최대 긴장점.",
-            "결(結): 갈등 해소, 복선 회수(Catharsis), 변화된 주인공의 모습 제시."
-        ]
-        # 로컬 임베딩 모델을 사용하여 벡터 DB 생성
-        return FAISS.from_texts(texts, self.embeddings)
-
-    def generate_plot(self, user_setting: str) -> Dict:
-        """사용자 설정을 기반으로 기승전결 플롯 생성"""
-        # 1. RAG 검색
-        query = f"{user_setting}에 적합한 서사 구조 가이드라인"
-        docs = self.narrative_db.similarity_search(query, k=2)
-        guideline = "\n".join([doc.page_content for doc in docs])
-
-        # 2. 메인 플롯 생성 프롬프트 (Local LLM의 지시 이행 능력을 고려하여 명확하게 작성)
+    def generate_global_synopsis(self, user_setting: str) -> str:
+        """전체 흐름을 가지는 하나의 통합된 시놉시스 생성"""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "당신은 전문 소설가입니다. 다음 가이드라인과 설정을 바탕으로 반드시 '기, 승, 전, 결'의 구조를 갖춘 구체적인 소설 플롯을 작성하세요."),
-            ("user", f"가이드라인:\n{{guideline}}\n\n사용자 설정:\n{{setting}}\n\n"
-                     "위 내용을 바탕으로 각 단계별 상세 줄거리와 핵심 복선을 한국어로 자세히 작성해줘.")
+            ("system", "당신은 전문 웹소설 기획자입니다. 사용자의 설정을 바탕으로 시작부터 끝까지 인과관계가 매끄럽게 이어지는 하나의 상세한 전체 줄거리(Synopsis)를 작성하세요. 기승전결 같은 목차를 나누지 말고 자연스러운 산문 형태로 작성하십시오."),
+            ("user", f"설정: {user_setting}")
         ])
-
-        chain = prompt | self.llm
-        response = chain.invoke({"guideline": guideline, "setting": user_setting})
         
-        return {
-            "full_plot": response.content,
-            "guideline_used": guideline
-        }
+        synopsis = (prompt | self.llm | StrOutputParser()).invoke({})
+        self.world_db.add_lore(synopsis, keywords="global_synopsis, main_plot")
+        return synopsis
+    
+    def extract_scene_beats(self, synopsis: str) -> list:
+        """전체 줄거리를 N개의 세부 챕터(Scene) 목표로 동적 분할"""
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "당신은 소설 감독입니다. 제공된 전체 줄거리를 바탕으로, 작가가 순차적으로 집필할 수 있도록 세부 '씬(Scene) 목표'들을 추출하세요.\n"
+                       "출력은 반드시 아래 JSON 배열 형식만 반환해야 합니다.\n"
+                       "[\n  {{\"scene_number\": 1, \"goal\": \"씬의 구체적인 목표와 발생해야 할 사건\"}},\n  ...\n]"),
+            ("user", f"전체 줄거리:\n{synopsis}")
+        ])
+        
+        response = (prompt | self.llm | self.json_parser).invoke({})
+        
+        try:
+            # LLM이 출력한 JSON 문자열 파싱
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                scenes = json.loads(json_match.group())
+                return scenes
+            else:
+                raise ValueError("JSON format not found in response")
+        except Exception as e:
+            print(f"[Error] Scene 파싱 실패: {e}")
+            print(f"[Raw Output]\n{response}")
+            # Fallback: 파싱 실패 시 전체 시놉시스를 하나의 씬으로 간주하여 반환
+            return [{"scene_number": 1, "goal": synopsis}]
+    
     
 class PartWriterAgent:
-    def __init__(self, part_name: str, world_db, critic_agent , model_name="bnksys/yanolja-eeve-korean-instruct-10.8b"):
-        self.part_name = part_name
+    def __init__(self, world_db, critic_agent, model_name="bnksys/yanolja-eeve-korean-instruct-10.8b"):
+        
         self.world_db = world_db
         self.critic = critic_agent  
         self.llm = ChatOllama(model=model_name, temperature=0.7, num_ctx=8192)
         
         # 메모리 구조 정의
-        self.local_memory = ""  # 현재 집필 중인 에피소드의 상세 내용
-        self.part_memory = []   # 완료된 에피소드들의 요약 리스트
+        self.part_name = "" # 실행 시 동적 할당
+        self.local_memory = ""  
+        self.part_memory = []   
         self.episode_count = 0
+        self.total_episode_count = 0
 
     def _summarize_episode(self, episode_content: str) -> str:
         """에피소드가 끝날 때 내용을 요약하여 part_memory에 저장"""
@@ -95,50 +95,50 @@ class PartWriterAgent:
         response = chain.invoke({}).strip().upper()
         return "YES" in response
 
-    def write_step(self, global_goal: str):
-        """에피소드 단위로 글을 생성하고 메모리를 업데이트하는 루프"""
+    def write_step(self, part_name: str, specific_goal: str):
+        self.part_name = part_name
+        self.episode_count = 0
         print(f"\n--- [{self.part_name}] 파트 집필 시작 ---")
+        print(f"▶ 이번 챕터 목표: {specific_goal}")
         
+        global_goal = specific_goal
+
         while True:
             self.episode_count += 1
-            print(f">> 에피소드 {self.episode_count} 집필 중...")
+            self.total_episode_count += 1
 
-            # 1. RAG를 통한 전역 설정 및 이전 요약 참조
-            # World DB에서 관련 설정 검색
-            relevant_lore = self.world_db.similarity_search(global_goal, k=2)
-            context_lore = "\n".join([doc.page_content for doc in relevant_lore])
+            relevant_context = self.world_db.retrieve_context(global_goal, k=3)
             
-            # 2. 본문 생성 프롬프트
             write_prompt = ChatPromptTemplate.from_messages([
-                ("system", f"당신은 소설의 '{self.part_name}' 파트를 담당하는 작가입니다. 다음 설정을 엄격히 준수하세요."),
-                ("user", f"전체 목표: {global_goal}\n"
-                         f"세계관 설정: {context_lore}\n"
-                         f"이전 줄거리 요약: {' -> '.join(self.part_memory)}\n"
+                ("system", f"당신은 소설의 '{self.part_name}' 파트를 담당하는 작가입니다. 요약이나 설정 설명이 아닌 '구체적인 묘사와 대화로 이루어진 소설 본문'만 출력하세요."),
+                ("user", f"이번 파트 목표: {global_goal}\n"
+                         f"관련 설정 및 이전 맥락: {relevant_context}\n"
                          f"현재 상황(local): {self.local_memory}\n\n"
-                         f"위 내용을 이어받아 이번 에피소드의 구체적인 묘사와 대화를 작성해줘.")
+                         f"위 내용을 이어받아 이번 에피소드의 본문을 작성해줘.")
             ])
 
-            chain = write_prompt | self.llm | StrOutputParser()
-            new_content = chain.invoke({})
-            feedback = self.critic.critique_episode(new_content, global_goal, " -> ".join(self.part_memory))
+            new_content = (write_prompt | self.llm | StrOutputParser()).invoke({})
+            
+            # # --- Critic Agent 검토 및 최대 5회 재작성 루프 ---
+            # max_retries = 5
+            # for attempt in range(max_retries):
+            #     feedback = self.critic.critique_episode(new_content, global_goal, " -> ".join(self.part_memory))
 
-            # 3. Local Memory 업데이트 및 출력
-            if not feedback['is_passed']:
-                print(f"!! 검토 실패 (점수: {feedback['score']}). 재집필을 시작합니다.")
-                new_content = self.critic.revise_content(new_content, feedback['critique'])
-                # 수정된 내용으로 local_memory 업데이트
-                self.local_memory = new_content 
-            else:
-                print(f"OK: 검토 통과 (점수: {feedback['score']})")
-                self.local_memory = new_content
+            #     if feedback['is_passed']:
+            #         print(f"OK: 검토 통과 (점수: {feedback['score']}점, 시도: {attempt+1}/{max_retries})")
+            #         break
+            #     else:
+            #         print(f"!! 검토 실패 (점수: {feedback['score']}점, 시도: {attempt+1}/{max_retries}). 피드백을 반영하여 재집필합니다...")
+            #         new_content = self.critic.revise_content(new_content, feedback['critique'])
             
-            # 4. 에피소드 종료 및 Part Memory 업데이트
+            # 루프 종료 후 최종(가장 개선된) 결과를 로컬 메모리에 저장
+            self.local_memory = new_content
+            
             summary = self._summarize_episode(new_content)
-            self.part_memory.append(f"에피소드 {self.episode_count}: {summary}")
+            self.part_memory.append(f"에피소드 {self.total_episode_count}: {summary}")
+            self.world_db.add_episode_summary(self.part_name, self.total_episode_count, summary)
             
-            # 5. 파트 완료 조건 체크
-            if self._check_part_completion(global_goal) or self.episode_count >= 5: # 무한 루프 방지
-                print(f"--- [{self.part_name}] 목표 달성. 다음 파트로 전환합니다. ---")
+            if self._check_part_completion(global_goal) or self.episode_count >= 5:
                 break
         
         return {
@@ -156,29 +156,49 @@ class CriticAgent:
     def critique_episode(self, content: str, global_goal: str, previous_summary: str) -> Dict:
         """생성된 에피소드를 검토하고 점수 및 피드백 반환"""
         
-        # 1. RAG에서 원본 설정(Lore) 추출
-        relevant_lore = self.world_db.similarity_search(content, k=3)
-        lore_context = "\n".join([doc.page_content for doc in relevant_lore])
+        # 1. WorldDatabase의 retrieve_context를 활용하여 원본 설정(Lore) 추출
+        # 기존 similarity_search 호출 및 리스트 컴프리헨션 구문 대체
+        lore_context = self.world_db.retrieve_context(content, type_filter="lore", k=3)
 
         # 2. 비판 프롬프트 구성
         critique_prompt = ChatPromptTemplate.from_messages([
-            ("system", "당신은 냉철한 소설 편집자입니다. 아래 기준에 따라 집필된 원고를 검토하세요.\n"
-                       "1. 설정 오류: 인물, 배경, 시대적 배경이 기존 설정과 충돌하는가?\n"
-                       "2. 서사 목표: 이번 파트의 목적(Plot Goal)을 달성하고 있는가?\n"
-                       "3. 가독성: 문장의 흐름이 자연스럽고 묘사가 구체적인가?"),
-            ("user", f"--- 원본 설정 ---\n{lore_context}\n\n"
-                     f"--- 이전 줄거리 ---\n{previous_summary}\n\n"
-                     f"--- 이번 파트 목표 ---\n{global_goal}\n\n"
-                     f"--- 검토할 원고 ---\n{content}\n\n"
-                     "위 내용을 바탕으로 'SCORE: 점수(0-100)', 'CRITIQUE: 내용' 형식으로 답변하세요.")
+            ("system", 
+             "당신은 냉철한 웹소설 편집장입니다. 원고를 평가하여 점수와 비판을 제공하세요.\n\n"
+             "[평가 기준]\n"
+             "1. 소설적 묘사(가장 중요): 원고가 사건을 단순히 요약/설명하고 있지는 않은가? 구체적인 행동 묘사와 대화로 이루어져 있는가?\n"
+             "2. 핍진성: 인물과 배경이 기존 설정(Lore)과 충돌하지 않고 자연스러운가?\n"
+             "3. 서사 목표: 이번 파트의 목적(Plot Goal)을 달성하고 있는가?\n\n"
+             "[출력 규정]\n"
+             "반드시 아래의 정확한 템플릿 구조로만 답변하십시오. 다른 인사말이나 부연 설명은 절대 금지합니다.\n"
+             "SCORE: [0에서 100 사이의 정수만 입력]\n"
+             "CRITIQUE: [구체적인 비판 및 수정 지시 내용]"),
+            ("user", 
+             f"--- 원본 설정(Lore) ---\n{lore_context}\n\n"
+             f"--- 이전 줄거리 ---\n{previous_summary}\n\n"
+             f"--- 이번 파트 목표 ---\n{global_goal}\n\n"
+             f"--- 검토할 원고 ---\n{content}")
         ])
 
         chain = critique_prompt | self.llm | self.output_parser
         response = chain.invoke({})
         
         # 결과 파싱
-        score_match = re.search(r"SCORE:\s*(\d+)", response)
-        score = int(score_match.group(1)) if score_match else 70
+        score_match = re.search(r"(?:SCORE|점수)\s*[:\-]?\s*(\d+)", response, re.IGNORECASE)
+        
+        if score_match:
+            score = int(score_match.group(1))
+        else:
+            # 파싱 1차 실패 시 응답 전체에서 2~3자리 숫자 추출 시도
+            fallback_match = re.search(r"\b(\d{2,3})\b", response)
+            if fallback_match:
+                score = int(fallback_match.group(1))
+            else:
+                # 파싱 완전 실패 시 (Fail 처리인 50점 부여)
+                score = 50 
+            
+            # 파싱 실패 원인 분석을 위한 디버깅 로그 출력
+            print(f"\n[Warning: Critic Parsing Issue] 모델 출력 포맷이 어긋났습니다. 파싱된 점수: {score}")
+            print(f"[Raw Output] {response}\n")
         
         return {
             "score": score,
@@ -187,10 +207,14 @@ class CriticAgent:
         }
 
     def revise_content(self, content: str, critique: str) -> str:
-        """비판 내용을 바탕으로 원고 수정 지시"""
+        """비판 내용을 바탕으로 오직 소설 본문만 재작성하도록 강제"""
         revision_prompt = ChatPromptTemplate.from_messages([
-            ("system", "당신은 작가입니다. 편집자의 비판 내용을 수용하여 원고를 더 완벽하게 수정하세요."),
-            ("user", f"원본 원고: {content}\n\n편집자 비판: {critique}\n\n수정된 원고를 작성하세요.")
+            ("system", "당신은 프로 웹소설 작가입니다. 편집자의 비판(Critique)을 완벽히 수용하여 소설 원고를 전면 수정하십시오.\n\n"
+                       "[절대 엄수 규칙]\n"
+                       "1. '수정된 원고:', '원본 원고:' 등의 접두사나 안내 문구를 절대 출력하지 마십시오.\n"
+                       "2. 편집자의 비판 내용(예: 캐릭터 개발, 결말 분석 등)을 출력 텍스트에 덧붙이거나 해설하지 마십시오.\n"
+                       "3. 오직 대화와 묘사로 이루어진 **'수정된 소설의 본문 텍스트'**만 순수하게 출력하십시오."),
+            ("user", f"--- 원본 원고 ---\n{content}\n\n--- 편집자 비판 ---\n{critique}\n\n위 비판을 바탕으로 수정된 소설 본문만 작성하세요.")
         ])
         chain = revision_prompt | self.llm | self.output_parser
         return chain.invoke({})
