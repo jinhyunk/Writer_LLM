@@ -72,6 +72,16 @@ class WorldDatabase:
         self.db.add_documents([doc])
         self.save_db()
 
+    def update_character_status(self, name: str, recent_status: str):
+        """기존 인물의 특정 에피소드 내 감정, 행동, 상태 변화(Status Update) 기록"""
+        doc = Document(
+            page_content=f"[인물 최신 상태: {name}] {recent_status}",
+            metadata={"type": "character", "name": name, "sub_type": "status"}
+        )
+        self.db.add_documents([doc])
+        self.save_db()
+        print(f"  [World DB] 인물 상태 업데이트 완료: {name}")
+        
     def add_episode_summary(self, part_name: str, episode_num: int, summary: str):
         """에피소드 요약 저장 (Part Writer용)"""
         doc = Document(

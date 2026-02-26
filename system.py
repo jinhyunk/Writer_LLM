@@ -18,13 +18,16 @@ class FullStoryOrchestrator:
         self.full_story_manuscript = []
 
     def run_full_novel(self, user_setting: str):
+        print("\n[Step 0] 기본 설정 기반 세계관 유기적 확장 중...")
+        self.main_writer.expand_world_setting(user_setting)
+
+        # 2. 메인 플롯 설계 (확장된 세계관을 RAG로 자동 참조함)
         print("\n[Step 1] 전체 시놉시스 설계 시작...")
         synopsis = self.main_writer.generate_global_synopsis(user_setting)
         
-        print("\n[Step 2] 시놉시스 기반 Scene 분할 (Beat Sheet 생성) 중...")
+        # 3. Scene 분할 
+        print("\n[Step 2] 시놉시스 기반 Scene 분할 중...")
         scenes = self.main_writer.extract_scene_beats(synopsis)
-        
-        print(f"[시스템] 총 {len(scenes)}개의 Scene이 도출되었습니다.")
         
         # 분할된 Scene Goal을 World DB에 기록
         for scene in scenes:
