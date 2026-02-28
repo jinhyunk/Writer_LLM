@@ -21,27 +21,24 @@ class FullStoryOrchestrator:
         print("\n[Step 0] 기본 설정 기반 세계관 유기적 확장 중...")
         self.main_writer.expand_world_setting(user_setting)
 
-        # 2. 메인 플롯 설계 (확장된 세계관을 RAG로 자동 참조함)
         print("\n[Step 1] 전체 시놉시스 설계 시작...")
         synopsis = self.main_writer.generate_global_synopsis(user_setting)
         
-        # 3. Scene 분할 
         print("\n[Step 2] 시놉시스 기반 Scene 분할 중...")
         scenes = self.main_writer.extract_scene_beats(synopsis)
         
-        # 분할된 Scene Goal을 World DB에 기록
+        # [수정됨] 분할된 Scene Goal을 World DB에 기록할 때 'main_goal' 키를 참조
         for scene in scenes:
-            self.world_db.add_scene_goal(scene["scene_number"], scene["goal"])
+            self.world_db.add_scene_goal(scene["scene_number"], scene["main_goal"])
 
         # 3. Scene 단위 순차 집필 루프
         for scene in scenes:
             scene_num = scene["scene_number"]
-            goal = scene["goal"]
             
             print(f"\n{'='*20} Chapter {scene_num} 집필 프로세스 시작 {'='*20}")
             
-            # Part Writer는 scene_num과 해당 goal을 타겟으로 집필 수행
-            result = self.part_writer.write_step(part_name=f"Chapter_{scene_num}", specific_goal=goal)
+            # [수정됨] specific_goal 파라미터 대신, scene 딕셔너리 전체(scene_data)를 넘겨줍니다.
+            result = self.part_writer.write_step(part_name=f"Chapter_{scene_num}", scene_data=scene)
             
             self.full_story_manuscript.append(f"\n\n{result['final_content']}")
 

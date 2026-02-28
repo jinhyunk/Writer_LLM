@@ -1,27 +1,23 @@
 import os
 import json
-from typing import List, Optional
+from typing import List, Dict, Optional
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
 
 class WorldDatabase:
     def __init__(self, embedding_model, save_path: str = "./world_db_index"):
         self.embeddings = embedding_model
         self.save_path = save_path
-        # 런타임 동기화를 위한 캐릭터 상태 DB 파일 (Editor 파일과는 별개의 운영 DB)
-        self.character_db_path = os.path.join(save_path, "characters_runtime.json")
+        self.character_db_path = f"{save_path}/characters.json"
         self.db = None
         
-        # 디렉토리가 없으면 안전하게 생성
-        os.makedirs(save_path, exist_ok=True)
-        
-        # FAISS 인덱스 파일이 실제로 존재하는지 확인 후 로드
-        if os.path.exists(os.path.join(save_path, "index.faiss")):
+        if os.path.exists(save_path):
             self.load_db()
         else:
             self.create_new_db()
             
-        # KV Store for Characters (인물 상태 런타임 메모리)
+        # KV Store for Characters
         self.characters = self.load_character_db()
 
     def create_new_db(self):
@@ -31,7 +27,6 @@ class WorldDatabase:
             embedding=self.embeddings,
             metadatas=[{"type": "system", "timestamp": 0}]
         )
-        self.save_db() # 초기화 즉시 저장
 
     def save_db(self):
         self.db.save_local(self.save_path)
@@ -53,33 +48,22 @@ class WorldDatabase:
         with open(self.character_db_path, 'w', encoding='utf-8') as f:
             json.dump(self.characters, f, ensure_ascii=False, indent=2)
 
-    # --- Vector DB Management (Immutable Lore & History) ---
-
     def add_lore(self, content: str, keywords: str):
-        """불변하는 세계관, 배경지식 저장"""
         doc = Document(page_content=content, metadata={"type": "lore", "keywords": keywords})
         self.db.add_documents([doc])
         self.save_db()
 
-    def add_episode_summary(self, part_name: str, episode_num: int, summary: str):
-        """지나간 에피소드의 요약 히스토리 저장 (추후 회상이나 맥락 참조용)"""
-        doc = Document(
-            page_content=f"[{part_name} - Ep.{episode_num}] {summary}", 
-            metadata={"type": "episode", "part": part_name, "seq": episode_num}
-        )
+    def add_scene_goal(self, scene_number: int, goal_content: str):
+        doc = Document(page_content=f"[Scene {scene_number} 목표] {goal_content}", metadata={"type": "scene_goal", "scene_num": scene_number})
         self.db.add_documents([doc])
         self.save_db()
 
-    def retrieve_context(self, query: str, type_filter: Optional[str] = None, k: int = 3) -> str:
-        """Vector DB에서 쿼리와 관련된 설정(lore)이나 과거 요약(episode)을 시맨틱 검색"""
-        search_kwargs = {"k": k}
-        if type_filter:
-            search_kwargs["filter"] = {"type": type_filter}
-        
-        docs = self.db.similarity_search(query, **search_kwargs)
-        return "\n".join([f"- {doc.page_content}" for doc in docs])
+    def add_episode_summary(self, part_name: str, episode_num: int, summary: str):
+        doc = Document(page_content=f"[{part_name} - Ep.{episode_num}] {summary}", metadata={"type": "episode", "part": part_name, "seq": episode_num})
+        self.db.add_documents([doc])
+        self.save_db()
 
-    # --- Character State Management (Mutable KV Store) ---
+    # --- Character State Management ---
     
     def add_character_profile(self, name: str, profile: str):
         """최초 생성: 캐릭터의 코어 프로필을 확정하고 불변으로 유지"""
@@ -89,30 +73,27 @@ class WorldDatabase:
                 "recent_status": "이야기에 새롭게 등장함"
             }
             self.save_character_db()
-            print(f"  [World DB] 신규 인물 런타임 등록 완료: {name}")
+            print(f"  [World DB] 신규 인물 등록 완료: {name}")
 
-    def update_character_core_profile(self, name: str, new_core_profile: str):
-        """[주의] 인물의 근본적인 설정이 바뀌는 중대 사건 발생 시에만 제한적으로 호출됨"""
-        if name in self.characters:
-            self.characters[name]["core_profile"] = new_core_profile
-            self.save_character_db()
-            print(f"  [World DB Warning] 인물 핵심 설정(Core Profile) 영구 변경 발생: {name}")
-    
-    
     def update_character_status(self, name: str, recent_status: str):
-        """상태 업데이트: 에피소드 진행에 따른 최신 상태/감정만 덮어쓰기"""
+        """상태 업데이트: 캐릭터의 일관성을 위해 recent_status만 덮어쓰기"""
         if name in self.characters:
             self.characters[name]["recent_status"] = recent_status
             self.save_character_db()
-            print(f"  [World DB] 인물 상태 런타임 업데이트 완료: {name}")
+            print(f"  [World DB] 인물 상태 업데이트 완료: {name}")
 
     def get_character_context(self, active_characters: List[str]) -> str:
-        """KV 스토어에서 이번 에피소드에 등장할 활성 캐릭터의 최신 정보만 1:1 매칭하여 반환"""
+        """KV 스토어에서 활성 캐릭터의 고정 프로필과 최신 상태를 하드코딩하여 반환"""
         context = []
         for name in active_characters:
             if name in self.characters:
                 char_data = self.characters[name]
                 context.append(f"[{name}] 기본 설정(불변): {char_data['core_profile']} | 최신 상태: {char_data['recent_status']}")
         return "\n".join(context) if context else "아직 기록된 인물 정보가 없습니다."
-    
-            
+
+    def retrieve_context(self, query: str, type_filter: Optional[str] = None, k: int = 3) -> str:
+        search_kwargs = {"k": k}
+        if type_filter:
+            search_kwargs["filter"] = {"type": type_filter}
+        docs = self.db.similarity_search(query, **search_kwargs)
+        return "\n".join([f"- {doc.page_content}" for doc in docs])
