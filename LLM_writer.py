@@ -22,6 +22,15 @@ class EpisodeScenario(BaseModel):
     # Field description에 유연한 길이를 명시하여 과적합 방지
     scenes: List[Scene] = Field(description="에피소드의 기승전결을 완벽히 담아낼 수 있도록 3개에서 6개 사이의 씬으로 유연하게 구성된 리스트")
 
+class CharacterStateUpdate(BaseModel):
+    name: str = Field(description="상태를 업데이트할 인물명")
+    recent_status: str = Field(description="이번 씬을 겪은 후 인물의 현재 감정, 깨달음, 처한 상황을 1~2문장으로 요약")
+    is_major_event: bool = Field(description="인물의 가치관 붕괴 등 핵심 설정(Core Profile)을 아예 바꿔야 할 만큼의 극적인 전개가 있었는지 여부 (일반적으론 false)")
+    new_core_profile: str = Field(description="is_major_event가 true일 경우에만 작성할 새로운 핵심 설정. false면 빈 문자열")
+
+class StateUpdateList(BaseModel):
+    updates: List[CharacterStateUpdate] = Field(description="이번 씬에 등장한 인물들의 상태 업데이트 목록")
+
 class ScenarioWriterAgent:
     def __init__(self, world_db: WorldDatabase, model_name: str = "bnksys/yanolja-eeve-korean-instruct-10.8b"):
         self.world_db = world_db
@@ -90,15 +99,16 @@ class ScenarioWriterAgent:
 class TextWriterAgent:
     def __init__(self, world_db, model_name: str = "bnksys/yanolja-eeve-korean-instruct-10.8b"):
         self.world_db = world_db
+        # 1. 텍스트 본문 생성용 LLM
         self.creative_llm = ChatOllama(model=model_name, temperature=0.7, num_ctx=8192)
-        self.json_llm = ChatOllama(model=model_name, temperature=0.1, num_ctx=8192, format="json")
-        self.local_memory = "" # 에피소드 내의 직전 상황을 기억하는 단기 메모리
+        
+        # 2. 상태 업데이트 분석용 구조적 LLM (Pydantic 강제)
+        base_json_llm = ChatOllama(model=model_name, temperature=0.1, num_ctx=8192)
+        self.state_updater_llm = base_json_llm.with_structured_output(StateUpdateList)
+        
+        self.local_memory = "" 
 
     def write_scene_prose(self, scene_data: Dict[str, Any], active_characters: List[str], previous_draft: str = "", feedback: str = "") -> str:
-        """
-        초안 작성 및 피드백 기반 재작성을 모두 수행합니다.
-        """
-
         main_goal = scene_data.get("main_goal", "")
         current_conflict = scene_data.get("current_conflict", "")
         actions = "\n".join([f"- {act}" for act in scene_data.get("character_actions", [])])
@@ -107,13 +117,12 @@ class TextWriterAgent:
         character_context = self.world_db.get_character_context(active_characters)
         tail_memory = self.local_memory[-800:] if self.local_memory else "새로운 에피소드의 시작입니다."
 
-        # 피드백 유무에 따라 시스템 프롬프트의 강도가 달라집니다.
         if feedback:
             system_instruction = (
                 "당신은 프로 웹소설 작가입니다. 방금 작성한 초안이 편집자에게 반려되었습니다.\n"
-                "기존 초안의 문장 구조에 얽매이지 말고, 편집자의 [수정 지시]를 반영하여 본문을 완전히 새롭게 재작성(Rewrite)하십시오."
+                "기존 초안의 문장 구조에 얽매이지 말고, 편집자의 [수정 지시]를 완벽하게 반영하여 본문을 완전히 새롭게 재작성(Rewrite)하십시오."
             )
-            feedback_section = f"\n\n▶ [수정 지시] 편집자의 피드백 (반드시 반영할 것!):\n{feedback}\n\n▶ 반려된 이전 초안:\n{previous_draft}"
+            feedback_section = f"\n\n▶ [수정 지시] 편집자의 피드백 (반드시 반영할 것!):\n{feedback}\n\n▶ 반려된 이전 초안 (참고만 하고 똑같이 쓰지 마시오):\n{previous_draft}"
         else:
             system_instruction = (
                 "당신은 인물의 내면 심리와 대화를 생동감 있게 묘사하는 프로 웹소설 작가입니다.\n"
@@ -126,7 +135,8 @@ class TextWriterAgent:
              f"{system_instruction}\n\n"
              "[작법 원칙]\n"
              "1. 사건을 전지적 시점에서 요약(Telling)하지 말고, 구체적인 대화와 행동(Showing) 위주로 전개하세요.\n"
-             "2. 해설이나 안내 문구 없이 오직 소설 본문만 출력하십시오."
+             "2. 해설이나 안내 문구 없이 오직 소설 본문만 출력하십시오.\n"
+             "※ [절대 주의]: 사용자 프롬프트에 제공된 양식(▶ 표시나 제목, 기획 내용)을 본문에 절대 복사하여 출력하지 마시오."
             ),
             ("user", 
              "▶ 관련 세계관 설정:\n{lore}\n\n"
@@ -160,70 +170,36 @@ class TextWriterAgent:
 
     def _analyze_and_update_character_states(self, prose_text: str, active_characters: List[str]):
         """
-        작성된 텍스트를 읽고 인물의 recent_status를 추출하여 업데이트합니다.
-        중대 사건(Major Event) 발생 시에만 core_profile 수정을 허용합니다.
+        작성된 최종 텍스트를 읽고 인물의 recent_status를 안전하게 추출하여 DB를 업데이트합니다.
         """
         prompt = ChatPromptTemplate.from_messages([
             ("system", 
-             "당신은 캐릭터 설정 관리자입니다. 방금 작성된 소설 본문을 분석하여 인물들의 최신 상태를 추출하세요.\n\n"
-             "[상태 업데이트 지침 - 매우 중요]\n"
-             "1. 'recent_status': 이번 씬을 겪은 후 인물의 현재 감정, 새로 얻은 단서, 처한 상황을 1~2문장으로 요약합니다. (항상 업데이트 됨)\n"
-             "2. 'is_major_event': 인물의 가치관 붕괴, 신체적 영구 손상, 세력의 배신 등 **'핵심 설정(Core Profile)'을 아예 바꿔야 할 만큼의 극적인 전개**가 있었는지 논리값(true/false)으로 판단하세요. 일상적인 대화나 가벼운 갈등은 무조건 false입니다.\n"
-             "3. 'new_core_profile': is_major_event가 true일 경우에만 수정된 핵심 설정을 적습니다. false라면 빈 문자열(\"\")로 둡니다.\n\n"
-             "반드시 아래의 이중 중괄호가 이스케이프된 JSON 규격으로만 출력하십시오.\n"
-             "{{\n"
-             "  \"updates\": [\n"
-             "    {{\n"
-             "      \"name\": \"[인물명]\",\n"
-             "      \"recent_status\": \"[최신 감정/상태]\",\n"
-             "      \"is_major_event\": false,\n"
-             "      \"new_core_profile\": \"\"\n"
-             "    }}\n"
-             "  ]\n"
-             "}}"
+             "당신은 웹소설 세계관의 캐릭터 설정 관리자입니다. 방금 확정된 소설 본문을 분석하여 인물들의 최신 상태를 추출하세요.\n\n"
+             "[상태 업데이트 지침]\n"
+             "1. 'recent_status': 씬을 겪은 후 인물의 심리 변화나 현재 처한 구체적 상황을 요약합니다. (항상 업데이트 됨)\n"
+             "2. 'is_major_event': 인물의 가치관이 완전히 뒤바뀌는 등의 중대 사건일 때만 true로 설정하세요. 일상적인 대화나 가벼운 갈등은 무조건 false입니다."
             ),
-            ("user", "▶ 분석 대상 인물: {chars}\n\n▶ 소설 본문:\n{text}")
+            ("user", "▶ 분석 대상 인물: {chars}\n\n▶ 확정된 소설 본문:\n{text}")
         ])
 
-        response = (prompt | self.json_llm | StrOutputParser()).invoke({
-            "chars": str(active_characters),
-            "text": prose_text
-        })
-
-        updates = self._parse_json_robustly(response)
-        
-        for update in updates:
-            name = update.get("name")
-            if not name or name not in active_characters:
-                continue
-                
-            # 1. 단기 상태는 항상 업데이트
-            status = update.get("recent_status", "")
-            if status:
-                self.world_db.update_character_status(name, status)
-                
-            # 2. 일관성 유지를 위해 Major Event인 경우에만 Core Profile 변경 허용
-            is_major = update.get("is_major_event", False)
-            if is_major:
-                new_profile = update.get("new_core_profile", "")
-                if new_profile:
-                    self.world_db.update_character_core_profile(name, new_profile)
-
-    def _parse_json_robustly(self, text: str) -> List[Dict]:
-        """안전한 JSON 파싱 로직"""
         try:
-            clean_text = re.sub(r'```(?:json)?\n?', '', text)
-            clean_text = clean_text.replace('```', '').strip()
+            update_obj: StateUpdateList = (prompt | self.state_updater_llm).invoke({
+                "chars": str(active_characters),
+                "text": prose_text
+            })
             
-            data = json.loads(clean_text)
-            updates = []
-            
-            if isinstance(data, dict):
-                updates = data.get("updates", [])
-            elif isinstance(data, list):
-                updates = data
-                
-            return updates
+            for char_update in update_obj.updates:
+                name = char_update.name
+                if name not in active_characters:
+                    continue
+                    
+                # 1. 단기 상태(recent_status)는 항상 덮어쓰기 업데이트
+                if char_update.recent_status:
+                    self.world_db.update_character_status(name, char_update.recent_status)
+                    
+                # 2. Major Event인 경우에만 Core Profile 변경 허용 (캐붕 방지)
+                if char_update.is_major_event and char_update.new_core_profile:
+                    self.world_db.update_character_core_profile(name, char_update.new_core_profile)
+                    
         except Exception as e:
-            print(f"[State Update Error] 상태 추출 파싱 실패: {e}")
-            return []
+            print(f"  [State Update Error] 캐릭터 상태 추출에 실패하여 기존 상태를 유지합니다. 사유: {e}")
